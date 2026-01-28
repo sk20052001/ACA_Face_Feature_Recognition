@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+
+# Results / outputs
+results/
+
+# Model files
+models/*.dat
+# Build artifacts
+build/
+
+# Results / outputs
+results/
+
+# Model files
+models/*.dat
+
+# Dataset images
+data/images/
+
+# Editor files
+.vscode/
+
