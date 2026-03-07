@@ -9,17 +9,20 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <sstream>
+#include <iomanip>
 
 #include "timer.h"
 
 namespace fs = std::filesystem;
 
-// Pick a few landmark indices (dlib 68-point scheme)
+// Convert dlib::point -> cv::Point2f
 static cv::Point2f toCvPoint(const dlib::point& p) {
     return cv::Point2f((float)p.x(), (float)p.y());
 }
 
-// Simple utility: average a set of points
+// Average a set of points
 static cv::Point2f avgPoints(const std::vector<cv::Point2f>& pts) {
     cv::Point2f s(0,0);
     for (auto &p : pts) { s.x += p.x; s.y += p.y; }
@@ -27,9 +30,14 @@ static cv::Point2f avgPoints(const std::vector<cv::Point2f>& pts) {
     return s;
 }
 
+static bool isImageExt(std::string ext) {
+    for (auto &c : ext) c = (char)tolower(c);
+    return (ext == ".jpg" || ext == ".jpeg" || ext == ".png");
+}
+
 int main(int argc, char** argv) {
     // Usage:
-    // ./baseline_serial <models/shape_predictor_68_face_landmarks.dat> <data/images> <results_dir>
+    // ./baseline_serial <shape_predictor_68_face_landmarks.dat> <images_dir> <results_dir>
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0]
                   << " <shape_predictor_68_face_landmarks.dat> <images_dir> <results_dir>\n";
@@ -46,9 +54,27 @@ int main(int argc, char** argv) {
     dlib::shape_predictor sp;
     dlib::deserialize(model_path) >> sp;
 
+    // Collect file list (deterministic ordering)
+    std::vector<fs::path> files;
+    for (auto const& entry : fs::directory_iterator(images_dir)) {
+        if (!entry.is_regular_file()) continue;
+        if (!isImageExt(entry.path().extension().string())) continue;
+        files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+
+    if (files.empty()) {
+        std::cerr << "ERROR: No images found in: " << images_dir << "\n";
+        return 1;
+    }
+
     // Output CSVs
     std::ofstream time_csv(results_dir / "serial_times.csv");
     time_csv << "image,load_ms,detect_ms,landmarks_ms,total_ms,num_faces\n";
+
+    // Compute-only CSV (detect + landmarks)
+    std::ofstream compute_csv(results_dir / "serial_compute_times.csv");
+    compute_csv << "image,detect_ms,landmarks_ms,total_compute_ms,num_faces\n";
 
     std::ofstream lm_csv(results_dir / "landmarks.csv");
     lm_csv << "image,face_idx,"
@@ -57,27 +83,24 @@ int main(int argc, char** argv) {
 
     size_t img_count = 0;
 
-    for (auto const& entry : fs::directory_iterator(images_dir)) {
-        if (!entry.is_regular_file()) continue;
-        auto ext = entry.path().extension().string();
-        for (auto &c : ext) c = (char)tolower(c);
-        if (ext != ".jpg" && ext != ".jpeg" && ext != ".png") continue;
+    Timer t_batch;
+    t_batch.start();
 
-        const std::string img_name = entry.path().filename().string();
+    for (const auto& path : files) {
+        const std::string img_name = path.filename().string();
 
         Timer t_total; t_total.start();
 
         // Load image
         Timer t_load; t_load.start();
-        cv::Mat bgr = cv::imread(entry.path().string(), cv::IMREAD_COLOR);
+        cv::Mat bgr = cv::imread(path.string(), cv::IMREAD_COLOR);
         double load_ms = t_load.ms();
 
         if (bgr.empty()) {
-            std::cerr << "Failed to load: " << entry.path() << "\n";
+            std::cerr << "Failed to load: " << path << "\n";
             continue;
         }
 
-        // Convert to dlib image wrapper
         dlib::cv_image<dlib::bgr_pixel> dimg(bgr);
 
         // Face detect
@@ -93,28 +116,27 @@ int main(int argc, char** argv) {
         double lm_ms = t_lm.ms();
 
         double total_ms = t_total.ms();
+        double total_compute_ms = det_ms + lm_ms;
 
         // Record timing
         time_csv << img_name << ","
                  << load_ms << "," << det_ms << "," << lm_ms << ","
                  << total_ms << "," << faces.size() << "\n";
 
-        // Optional overlay: draw landmarks for first face
-        cv::Mat overlay = bgr.clone();
+        compute_csv << img_name << ","
+                    << det_ms << "," << lm_ms << ","
+                    << total_compute_ms << "," << faces.size() << "\n";
 
+        // Overlay
+        cv::Mat overlay = bgr.clone();
         for (size_t fi = 0; fi < shapes.size(); fi++) {
             const auto& s = shapes[fi];
 
-            // Gather key feature points (indices based on 68-landmark convention)
-            // Left eye: 36-41, Right eye: 42-47
             std::vector<cv::Point2f> left_eye, right_eye;
             for (int i = 36; i <= 41; i++) left_eye.push_back(toCvPoint(s.part(i)));
             for (int i = 42; i <= 47; i++) right_eye.push_back(toCvPoint(s.part(i)));
 
-            // Nose tip: 30
             cv::Point2f nose = toCvPoint(s.part(30));
-
-            // Mouth corners: 48 (left), 54 (right)
             cv::Point2f mouth_l = toCvPoint(s.part(48));
             cv::Point2f mouth_r = toCvPoint(s.part(54));
 
@@ -128,14 +150,12 @@ int main(int argc, char** argv) {
                    << mouth_l.x << "," << mouth_l.y << ","
                    << mouth_r.x << "," << mouth_r.y << "\n";
 
-            // Draw points
             cv::circle(overlay, le, 3, {0,255,0}, -1);
             cv::circle(overlay, re, 3, {0,255,0}, -1);
             cv::circle(overlay, nose, 3, {255,0,0}, -1);
             cv::circle(overlay, mouth_l, 3, {0,0,255}, -1);
             cv::circle(overlay, mouth_r, 3, {0,0,255}, -1);
 
-            // Draw all landmarks as small dots (optional)
             for (int i = 0; i < s.num_parts(); i++) {
                 cv::circle(overlay, toCvPoint(s.part(i)), 1, {255,255,0}, -1);
             }
@@ -145,8 +165,21 @@ int main(int argc, char** argv) {
         img_count++;
     }
 
+    double batch_total_ms = t_batch.ms();
+
+    // run summary
+    {
+        std::ofstream summary(results_dir / "run_summary.csv");
+        summary << "mode,threads,images,preload_ms,batch_compute_ms,batch_total_ms\n";
+        summary << "serial,1," << img_count << ",,,"
+                << std::fixed << std::setprecision(2) << batch_total_ms << "\n";
+    }
+
     std::cout << "Done. Processed " << img_count << " images.\n"
               << "Wrote:\n  " << (results_dir / "serial_times.csv") << "\n  "
-              << (results_dir / "landmarks.csv") << "\n";
+              << (results_dir / "serial_compute_times.csv") << "\n  "
+              << (results_dir / "landmarks.csv") << "\n  "
+              << (results_dir / "run_summary.csv") << "\n";
+
     return 0;
 }

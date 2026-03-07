@@ -1,0 +1,20 @@
+Serial vs Parallel Analysis (500 images) — Batch-time Based
+Generated: 2026-03-07T15:22:29
+
+=== End-to-End Speedup (Batch Total Time) ===
+Serial images: 500
+Config            Batch(ms)    Speedup
+----------------------------------------
+serial            218954.48       1.00
+omp_e2e_1         221483.92       0.99
+omp_e2e_2         141714.72       1.55
+omp_e2e_4          90598.82       2.42
+omp_e2e_8          65990.66       3.32
+
+=== Compute-only Speedup (Batch Compute Time) ===
+Config          Compute(ms)    Speedup
+----------------------------------------
+preload_1         213961.49       1.00
+preload_2         138953.90       1.54
+preload_4          85856.08       2.49
+preload_8          68698.18       3.11
