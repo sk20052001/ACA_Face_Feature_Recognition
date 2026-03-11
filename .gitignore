@@ -8,7 +8,6 @@
 *.obj
 
 test_images/
-*.jpg
 *.zip
 
 # Precompiled Headers
