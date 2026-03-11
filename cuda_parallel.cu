@@ -1,20 +1,28 @@
-#include <dlib/image_processing/frontal_face_detector.h>
-#include <dlib/image_processing.h>
+#include <dlib/image_processing/shape_predictor.h>
 #include <dlib/opencv.h>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/cudaimgproc.hpp>
-#include <opencv2/cudaobjdetect.hpp>
-
-#include <cuda_runtime.h>
 
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <random>
+#include <set>
 
 namespace fs = std::filesystem;
+
+static bool isImageFile(const fs::path& p) {
+    static const std::set<std::string> exts = {
+        ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"
+    };
+    std::string ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return exts.count(ext) > 0;
+}
 
 static cv::Point2f toCvPoint(const dlib::point& p) {
     return cv::Point2f((float)p.x(), (float)p.y());
@@ -36,17 +44,26 @@ struct ResultData {
 
 void processImageGPU(
     const std::string& img_path,
-    cv::Ptr<cv::cuda::CascadeClassifier>& face_detector,
+    const fs::path& images_dir,
+    const fs::path& results_dir,
+    cv::CascadeClassifier& face_cascade,
     dlib::shape_predictor& sp,
     std::ofstream& lm_csv,
     std::ofstream& time_csv,
-    cudaStream_t stream
+    cv::cuda::Stream& stream
 )
 {
-    std::string img_name = fs::path(img_path).filename().string();
+    // Use relative path from images_dir to avoid collisions from subdirectories
+    fs::path rel = fs::relative(img_path, images_dir);
+    std::string img_label = rel.string(); // e.g. "person/img_0001.jpg"
+    std::string img_name  = rel.filename().string();
 
     cv::Mat bgr = cv::imread(img_path);
     if (bgr.empty()) return;
+
+    // Mirror subdirectory structure under results_dir
+    fs::path out_dir = results_dir / rel.parent_path();
+    fs::create_directories(out_dir);
 
     //------------------------------------
     // Upload to GPU
@@ -60,34 +77,21 @@ void processImageGPU(
     //------------------------------------
 
     cv::cuda::GpuMat gpu_gray;
+    cv::cuda::cvtColor(gpu_img, gpu_gray, cv::COLOR_BGR2GRAY, 0, stream);
 
-    cv::cuda::cvtColor(
-        gpu_img,
-        gpu_gray,
-        cv::COLOR_BGR2GRAY,
-        0,
-        cv::cuda::StreamAccessor::wrapStream(stream)
-    );
+    // Download grayscale for CPU face detection
+    cv::Mat gray;
+    gpu_gray.download(gray, stream);
+    stream.waitForCompletion();
 
     //------------------------------------
-    // GPU Face Detection
-    //------------------------------------
-
-    cv::cuda::GpuMat facesBuf;
-
-    face_detector->detectMultiScale(
-        gpu_gray,
-        facesBuf,
-        cv::cuda::StreamAccessor::wrapStream(stream)
-    );
-
-    //------------------------------------
-    // Download detected faces
+    // Face Detection (CPU)
+    // Note: cv::cuda::CascadeClassifier's NCV XML parser is broken in
+    // OpenCV 4.14.0-pre; CPU classifier is used with GPU grayscale output.
     //------------------------------------
 
     std::vector<cv::Rect> faces;
-
-    face_detector->convert(facesBuf, faces);
+    face_cascade.detectMultiScale(gray, faces, 1.1, 3, 0, cv::Size(30, 30));
 
     //------------------------------------
     // Landmark detection (CPU)
@@ -123,7 +127,7 @@ void processImageGPU(
         cv::Point2f le = avgPoints(left_eye);
         cv::Point2f re = avgPoints(right_eye);
 
-        lm_csv << img_name << "," << fi << ","
+        lm_csv << img_label << "," << fi << ","
                << le.x << "," << le.y << ","
                << re.x << "," << re.y << ","
                << nose.x << "," << nose.y << ","
@@ -149,9 +153,9 @@ void processImageGPU(
     // Save overlay image
     //------------------------------------
 
-    cv::imwrite("results/overlay_" + img_name, overlay);
+    cv::imwrite((out_dir / ("overlay_" + img_name)).string(), overlay);
 
-    time_csv << img_name << "," << faces.size() << "\n";
+    time_csv << img_label << "," << faces.size() << "\n";
 }
 
 int main(int argc, char** argv)
@@ -176,12 +180,14 @@ int main(int argc, char** argv)
     dlib::deserialize(model_path) >> sp;
 
     //------------------------------------
-    // GPU Face detector
+    // Load face cascade
     //------------------------------------
 
-    cv::Ptr<cv::cuda::CascadeClassifier> face_detector =
-        cv::cuda::CascadeClassifier::create(
-            "haarcascade_frontalface_default.xml");
+    cv::CascadeClassifier face_cascade;
+    if (!face_cascade.load("haarcascade_frontalface_default.xml")) {
+        std::cerr << "Error: could not load haarcascade_frontalface_default.xml\n";
+        return 1;
+    }
 
     //------------------------------------
     // CSV Outputs
@@ -191,23 +197,31 @@ int main(int argc, char** argv)
     std::ofstream lm_csv(results_dir / "landmarks.csv");
 
     //------------------------------------
-    // Collect image paths
+    // Collect image paths (recursive, images only)
     //------------------------------------
 
     std::vector<std::string> image_paths;
 
-    for (auto& entry : fs::directory_iterator(images_dir))
-        image_paths.push_back(entry.path().string());
+    for (auto& entry : fs::recursive_directory_iterator(images_dir))
+        if (entry.is_regular_file() && isImageFile(entry.path()))
+            image_paths.push_back(entry.path().string());
+
+    std::cout << "Found " << image_paths.size() << " images\n";
+
+    const size_t SAMPLE = 500;
+    if (image_paths.size() > SAMPLE) {
+        std::mt19937 rng(std::random_device{}());
+        std::shuffle(image_paths.begin(), image_paths.end(), rng);
+        image_paths.resize(SAMPLE);
+        std::cout << "Randomly sampled " << SAMPLE << " images\n";
+    }
 
     //------------------------------------
     // Create CUDA streams
     //------------------------------------
 
     const int STREAMS = 4;
-    cudaStream_t streams[STREAMS];
-
-    for (int i = 0; i < STREAMS; i++)
-        cudaStreamCreate(&streams[i]);
+    cv::cuda::Stream streams[STREAMS];
 
     //------------------------------------
     // Process images in parallel streams
@@ -219,7 +233,9 @@ int main(int argc, char** argv)
 
         processImageGPU(
             image_paths[i],
-            face_detector,
+            images_dir,
+            results_dir,
+            face_cascade,
             sp,
             lm_csv,
             time_csv,
@@ -230,9 +246,6 @@ int main(int argc, char** argv)
     //------------------------------------
     // Cleanup
     //------------------------------------
-
-    for (int i = 0; i < STREAMS; i++)
-        cudaStreamDestroy(streams[i]);
 
     std::cout << "CUDA pipeline finished\n";
 }

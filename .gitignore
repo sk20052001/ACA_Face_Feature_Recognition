@@ -7,6 +7,10 @@
 *.o
 *.obj
 
+test_images/
+results/
+*.zip
+
 # Precompiled Headers
 *.gch
 *.pch
